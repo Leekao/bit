@@ -1,14 +1,13 @@
 /** @flow */
 import path from 'path';
 import R from 'ramda';
-import { DEFAULT_INDEX_NAME, COMPONENT_ORIGINS } from '../../constants';
+import { COMPONENT_ORIGINS } from '../../constants';
 import BitMap from '../bit-map/bit-map';
-import type { ComponentMapFile } from '../bit-map/component-map';
 import ComponentMap from '../bit-map/component-map';
 import { BitId } from '../../bit-id';
 import Component from '../component';
 import { Driver } from '../../driver';
-import { pathNormalizeToLinux, pathRelative, getWithoutExt } from '../../utils';
+import { pathNormalizeToLinux, pathRelative } from '../../utils';
 import logger from '../../logger/logger';
 import { Consumer } from '../../consumer';
 
@@ -24,6 +23,7 @@ import { Consumer } from '../../consumer';
  *
  * @param {Object} tree - contains direct deps for each file
  * @param {string[]} files - component files to search
+ * @param {string[]} testsFiles - component test files
  * @param {string} entryComponentId - component id for the entry of traversing - used to know which of the files are part of that component
  * @param {BitMap} bitMap
  * @param {string} consumerPath
@@ -33,6 +33,7 @@ import { Consumer } from '../../consumer';
 function findComponentsOfDepsFiles(
   tree: Object,
   files: string[],
+  testsFiles: string[],
   entryComponentId: string,
   bitMap: BitMap,
   consumerPath: string,
@@ -40,7 +41,9 @@ function findComponentsOfDepsFiles(
   componentFromModel
 ): Object {
   const packagesDeps = {};
+  let devPackagesDeps = {};
   const componentsDeps = {};
+  let devComponentsDeps = {};
   const untrackedDeps = [];
   const relativeDeps = []; // dependencies that are required with relative path (and should be required using 'bit/').
   const missingDeps = [];
@@ -119,7 +122,12 @@ function findComponentsOfDepsFiles(
     return { componentId, depFileRelative, destination };
   };
 
-  const processDepFile = (depFile: string, importSpecifiers?: Object, linkFile?: string) => {
+  const processDepFile = (
+    depFile: string,
+    importSpecifiers?: Object,
+    linkFile?: string,
+    isTestFile: boolean = false
+  ) => {
     if (processedFiles.includes(depFile)) return;
     processedFiles.push(depFile);
 
@@ -173,66 +181,103 @@ function findComponentsOfDepsFiles(
     if (componentsDeps[componentId]) {
       // it is another file of an already existing component. Just add the new path
       componentsDeps[componentId].push(depsPaths);
+    } else if (devComponentsDeps[componentId]) {
+      devComponentsDeps[componentId].push(depsPaths);
+    } else if (isTestFile) {
+      Object.assign(devComponentsDeps, currentComponentsDeps);
     } else {
       Object.assign(componentsDeps, currentComponentsDeps);
     }
   };
 
-  const processLinkFile = (linkFile) => {
+  const processLinkFile = (linkFile: Object, isTestFile: boolean = false) => {
     if (!linkFile.dependencies || R.isEmpty(linkFile.dependencies)) return;
     linkFile.dependencies.forEach((dependency) => {
       const component = getComponentIdByDepFile(linkFile.file);
       if (component.componentId) {
         // the linkFile is already a component, no need to treat it differently than other depFile
-        processDepFile(linkFile.file, dependency.importSpecifiers);
+        processDepFile(linkFile.file, dependency.importSpecifiers, undefined, isTestFile);
       } else {
-        processDepFile(dependency.file, dependency.importSpecifiers, linkFile.file);
+        processDepFile(dependency.file, dependency.importSpecifiers, linkFile.file, isTestFile);
       }
     });
   };
 
-  files.forEach((file) => {
-    const currentPackagesDeps = tree[file].packages;
-    if (currentPackagesDeps && !R.isEmpty(currentPackagesDeps)) {
-      Object.assign(packagesDeps, currentPackagesDeps);
+  const processDepFiles = (allDepsFiles: string[], importSpecifiers: Object, isTestFile: boolean = false) => {
+    if (allDepsFiles && !R.isEmpty(allDepsFiles)) {
+      allDepsFiles.forEach((depFile) => {
+        let finalImportSpecifiers = R.clone(importSpecifiers);
+        if (importSpecifiers) {
+          const importSpecifiersFound = importSpecifiers.find(specifierFile => specifierFile.file === depFile);
+          if (importSpecifiersFound) finalImportSpecifiers = importSpecifiersFound.importSpecifiers;
+        }
+        processDepFile(depFile, finalImportSpecifiers, undefined, isTestFile);
+      });
     }
-    const currentBitsDeps = tree[file].bits;
-    if (currentBitsDeps && !R.isEmpty(currentBitsDeps)) {
-      currentBitsDeps.forEach((bitDep) => {
+  };
+
+  const processLinkFiles = (allLinkFiles: Object[], isTestFile: boolean = false) => {
+    if (allLinkFiles && !R.isEmpty(allLinkFiles)) {
+      allLinkFiles.forEach((linkFile) => {
+        processLinkFile(linkFile, isTestFile);
+      });
+    }
+  };
+
+  const processBits = (bits, isTestFile: boolean = false) => {
+    if (bits && !R.isEmpty(bits)) {
+      bits.forEach((bitDep) => {
         const componentId = Consumer.getComponentIdFromNodeModulesPath(bitDep, bindingPrefix);
 
         const existingId = bitMap.getExistingComponentId(componentId);
         if (existingId) {
           const currentComponentsDeps = { [existingId]: [] };
           if (!componentsDeps[existingId]) {
-            Object.assign(componentsDeps, currentComponentsDeps);
+            if (isTestFile) {
+              Object.assign(devComponentsDeps, currentComponentsDeps);
+            } else {
+              Object.assign(componentsDeps, currentComponentsDeps);
+            }
           }
         } else {
           missingDeps.push(componentId);
         }
       });
     }
-    const allDepsFiles = tree[file].files;
-    if (allDepsFiles && !R.isEmpty(allDepsFiles)) {
-      allDepsFiles.forEach((depFile) => {
-        let importSpecifiers;
-        if (tree[file].importSpecifiers) {
-          const importSpecifiersFound = tree[file].importSpecifiers.find(
-            specifierFile => specifierFile.file === depFile
-          );
-          if (importSpecifiersFound) importSpecifiers = importSpecifiersFound.importSpecifiers;
-        }
-        processDepFile(depFile, importSpecifiers);
-      });
+  };
+
+  const processPackages = (packages, isTestFile) => {
+    if (packages && !R.isEmpty(packages)) {
+      if (isTestFile) {
+        Object.assign(devPackagesDeps, packages);
+      } else {
+        Object.assign(packagesDeps, packages);
+      }
     }
-    const allLinkFiles = tree[file].linkFiles;
-    if (allLinkFiles && !R.isEmpty(allLinkFiles)) {
-      allLinkFiles.forEach((linkFile) => {
-        processLinkFile(linkFile);
-      });
-    }
+  };
+
+  /**
+   * Remove the dependencies which appear both in dev and regular deps from the dev
+   * Because if a dependency is both dev dependency and regular dependecy it should be treated as regular one
+   * Apply for both packages and components dependencies
+   */
+  const removeDevDepsIfTheyAlsoRegulars = () => {
+    const devPackagesOnlyNames = R.difference(R.keys(devPackagesDeps), R.keys(packagesDeps));
+    devPackagesDeps = R.pick(devPackagesOnlyNames, devPackagesDeps);
+    const devComponentsOnlyNames = R.difference(R.keys(devComponentsDeps), R.keys(componentsDeps));
+    devComponentsDeps = R.pick(devComponentsOnlyNames, devComponentsDeps);
+  };
+
+  files.forEach((file) => {
+    const isTestFile = R.contains(file, testsFiles);
+    processPackages(tree[file].packages, isTestFile);
+    processBits(tree[file].bits, isTestFile);
+    processDepFiles(tree[file].files, tree[file].importSpecifiers, isTestFile);
+    processLinkFiles(tree[file].linkFiles, isTestFile);
   });
-  return { componentsDeps, packagesDeps, untrackedDeps, relativeDeps, missingDeps };
+  removeDevDepsIfTheyAlsoRegulars();
+
+  return { componentsDeps, devComponentsDeps, packagesDeps, devPackagesDeps, untrackedDeps, relativeDeps, missingDeps };
 }
 
 /**
@@ -296,6 +341,8 @@ export default (async function loadDependenciesForComponent(
     if (!testsFiles.length) return nonTestsTree;
     const testsTree = await driver.getDependencyTree(bitDir, consumerPath, testsFiles, component.bindingPrefix);
     // ignore package dependencies of tests for now
+    // console.log('nonTestsTree', JSON.stringify(nonTestsTree, null, 2));
+    // console.log('testsTree', JSON.stringify(testsTree, null, 2));
     testsTree.missing.packages = [];
     return mergeDependencyTrees([nonTestsTree, testsTree]);
   };
@@ -323,6 +370,7 @@ export default (async function loadDependenciesForComponent(
   const traversedDeps = findComponentsOfDepsFiles(
     dependenciesTree.tree,
     allFiles,
+    testsFiles,
     idWithConcreteVersionString,
     bitMap,
     consumerPath,
@@ -330,12 +378,18 @@ export default (async function loadDependenciesForComponent(
     componentFromModel
   );
   const traversedCompDeps = traversedDeps.componentsDeps;
+  const traversedCompDevDeps = traversedDeps.devComponentsDeps;
+
   component.dependencies = Object.keys(traversedCompDeps).map((depId) => {
     return { id: BitId.parse(depId), relativePaths: traversedCompDeps[depId] };
+  });
+  component.devDependencies = Object.keys(traversedCompDevDeps).map((depId) => {
+    return { id: BitId.parse(depId), relativePaths: traversedCompDevDeps[depId] };
   });
   const untrackedDependencies = traversedDeps.untrackedDeps;
   if (!R.isEmpty(untrackedDependencies)) missingDependencies.untrackedDependencies = untrackedDependencies;
   component.packageDependencies = traversedDeps.packagesDeps;
+  component.devPackageDependencies = traversedDeps.devPackagesDeps;
   if (!R.isEmpty(traversedDeps.relativeDeps)) {
     missingDependencies.relativeComponents = traversedDeps.relativeDeps;
   }
